@@ -1,0 +1,324 @@
+#!/usr/bin/env python3
+"""
+automated_data_analysis_agent.py
+自动化数据分析与洞察生成 Agent
+
+Usage:
+  python automated_data_analysis_agent.py --input data.csv --output report.md
+  python automated_data_analysis_agent.py --input data.xlsx --output report.md --target sales
+
+Dependencies:
+  pip install pandas numpy openpyxl scikit-learn
+  pip install openai    # optional for GPT-based enhancement
+"""
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+try:
+    from sklearn.ensemble import IsolationForest
+    from sklearn.preprocessing import StandardScaler
+except ImportError:
+    IsolationForest = None
+    StandardScaler = None
+
+try:
+    import openai
+except ImportError:
+    openai = None
+
+
+def load_data(path):
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Input file not found: {path}")
+
+    suffix = path.suffix.lower()
+    if suffix in {".csv", ".txt"}:
+        df = pd.read_csv(path)
+    elif suffix in {".xls", ".xlsx"}:
+        df = pd.read_excel(path)
+    elif suffix in {".parquet"}:
+        df = pd.read_parquet(path)
+    else:
+        raise ValueError("Unsupported file type: {}. Use CSV, XLSX, or PARQUET.".format(suffix))
+
+    return df
+
+
+def summarize_missing(df):
+    total_rows = len(df)
+    missing = df.isna().sum()
+    missing_pct = (missing / total_rows * 100).round(2)
+    return pd.DataFrame({"missing_count": missing, "missing_pct": missing_pct}).sort_values("missing_pct", ascending=False)
+
+
+def summarize_numeric(df):
+    numeric = df.select_dtypes(include=["number"])
+    if numeric.empty:
+        return pd.DataFrame()
+
+    describe = numeric.describe().T
+    describe = describe.assign(
+        skew=numeric.skew().round(3),
+        kurtosis=numeric.kurtosis().round(3),
+        zeros=(numeric == 0).sum(),
+    )
+    return describe
+
+
+def summarize_categorical(df, top_n=5):
+    cats = df.select_dtypes(include=["object", "category", "bool"])
+    summaries = []
+    for col in cats.columns:
+        value_counts = cats[col].value_counts(dropna=False).head(top_n)
+        summaries.append({
+            "column": col,
+            "dtype": str(cats[col].dtype),
+            "unique_values": cats[col].nunique(dropna=False),
+            "top_values": json.dumps(value_counts.to_dict(), ensure_ascii=False),
+        })
+    return pd.DataFrame(summaries)
+
+
+def correlation_summary(df, target=None, top_n=10):
+    numeric = df.select_dtypes(include=["number"])
+    if numeric.shape[1] < 2:
+        return pd.DataFrame()
+
+    corr = numeric.corr().abs()
+    if target and target in corr.columns:
+        target_corr = corr[target].drop(target).sort_values(ascending=False).head(top_n)
+        return target_corr.rename("abs_correlation").to_frame()
+
+    pairs = []
+    for i, col1 in enumerate(corr.columns):
+        for col2 in corr.columns[i + 1:]:
+            pairs.append({
+                "feature_1": col1,
+                "feature_2": col2,
+                "abs_correlation": corr.loc[col1, col2],
+            })
+    if not pairs:
+        return pd.DataFrame()
+    return pd.DataFrame(pairs).sort_values("abs_correlation", ascending=False).head(top_n)
+
+
+def detect_outliers(df, n_std=3):
+    numeric = df.select_dtypes(include=["number"]).dropna(axis=1, how="all")
+    if numeric.empty:
+        return pd.DataFrame()
+
+    stats = numeric.agg(["mean", "std"]).T
+    stats = stats.assign(
+        lower=stats["mean"] - n_std * stats["std"],
+        upper=stats["mean"] + n_std * stats["std"],
+    )
+    outlier_info = []
+    for col in numeric.columns:
+        column = numeric[col]
+        lower = stats.loc[col, "lower"]
+        upper = stats.loc[col, "upper"]
+        outlier_count = ((column < lower) | (column > upper)).sum()
+        outlier_info.append({
+            "column": col,
+            "outlier_count": int(outlier_count),
+            "outlier_pct": round(outlier_count / len(column) * 100, 2),
+        })
+    return pd.DataFrame(outlier_info).sort_values("outlier_pct", ascending=False)
+
+
+def detect_anomaly_scores(df, sample_size=5000):
+    if IsolationForest is None or StandardScaler is None:
+        return None
+
+    numeric = df.select_dtypes(include=["number"]).dropna(axis=1, how="all")
+    if numeric.shape[1] < 2 or df.shape[0] < 10:
+        return None
+
+    sample = numeric
+    if len(sample) > sample_size:
+        sample = sample.sample(sample_size, random_state=42)
+
+    scaler = StandardScaler()
+    scaled = scaler.fit_transform(sample)
+    model = IsolationForest(random_state=42, contamination=0.02)
+    model.fit(scaled)
+    anomaly_scores = model.decision_function(scaled)
+    anomalies = model.predict(scaled)
+    anomaly_frame = pd.DataFrame({
+        "score": anomaly_scores,
+        "anomaly": anomalies,
+    }, index=sample.index)
+    return anomaly_frame
+
+
+def build_insights(df, target=None):
+    insights = []
+    missing = summarize_missing(df)
+    num_missing_high = missing[missing["missing_pct"] > 20]
+    if not num_missing_high.empty:
+        insights.append(f"{len(num_missing_high)} 个字段缺失率超过 20%，建议检查数据采集或考虑删除/补全这些字段。")
+    else:
+        insights.append("无字段缺失率超过 20%，数据完整性较好。")
+
+    numeric = summarize_numeric(df)
+    if not numeric.empty:
+        high_skew = numeric[abs(numeric["skew"]) > 1]["skew"].sort_values(ascending=False)
+        if not high_skew.empty:
+            for col, skew in high_skew.items():
+                insights.append(f"数值字段 '{col}' 偏态严重 (skew={skew:.2f})，建议使用对数/Box-Cox 变换或分箱后建模。")
+
+        low_var = numeric[numeric["std"] == 0]
+        if not low_var.empty:
+            insights.append(f"存在常数字段 {', '.join(low_var.index.tolist())}，可考虑删除，因为对大多数建模无贡献。")
+
+    cats = summarize_categorical(df)
+    if not cats.empty:
+        low_cardinal = cats[cats["unique_values"] <= 3]
+        if not low_cardinal.empty:
+            insights.append(f"包含 {len(low_cardinal)} 个低基数字段（类别数 <= 3），适合直接 One-Hot 或 Target Encoding。")
+
+    correlation = correlation_summary(df, target=target, top_n=5)
+    if not correlation.empty:
+        if target and target in correlation.index:
+            for feature, row in correlation.iterrows():
+                insights.append(f"目标字段 '{target}' 与 '{feature}' 的绝对相关系数为 {row['abs_correlation']:.3f}，该特征可能对目标预测很重要。")
+        else:
+            top_pair = correlation.iloc[0]
+            insights.append(f"最强相关的两列是 '{top_pair['feature_1']}' 与 '{top_pair['feature_2']}'，绝对相关系数为 {top_pair['abs_correlation']:.3f}。")
+
+    outliers = detect_outliers(df)
+    if not outliers.empty:
+        significant = outliers[outliers["outlier_pct"] > 1]
+        if not significant.empty:
+            insights.append(f"{len(significant)} 个数值字段存在较多异常值 (outlier_pct > 1%)，推荐进一步检查样本分布和数据录入错误。")
+
+    datetime_cols = [col for col in df.columns if pd.api.types.is_datetime64_any_dtype(df[col])]
+    if datetime_cols:
+        insights.append(f"检测到时间字段：{', '.join(datetime_cols)}。可进一步做时间序列分析、趋势检测或季节性分析。")
+
+    if not target and "date" in df.columns.str.lower().tolist():
+        insights.append("建议识别日期/时间列并检查趋势、周期性和节假日影响。")
+
+    if not insights:
+        insights.append("数据分析未发现显著问题，建议根据业务目标进一步构建模型或可视化。")
+
+    return insights
+
+
+def call_openai_enhancement(insights, df, target=None):
+    if openai is None:
+        return None
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return None
+
+    openai.api_key = api_key
+    prompt = (
+        "请根据以下数据分析发现，生成一段结构化的商业洞察与建议。\n"
+        "数据集字段：\n" + ", ".join(df.columns.astype(str).tolist()) + "\n"
+        "如果存在目标字段，请输出推荐特征组合并说明原因。\n"
+        "已识别要点：\n" + "\n".join(f"- {item}" for item in insights) + "\n"
+        "请给出 1) 关键结论 2) 异常与风险 3) 改进建议。"
+    )
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "system", "content": "你是一个数据分析专家。"}, {"role": "user", "content": prompt}],
+            temperature=0.7,
+            max_tokens=450,
+        )
+        return response["choices"][0]["message"]["content"].strip()
+    except Exception as exc:
+        print(f"OpenAI 增强调用失败: {exc}", file=sys.stderr)
+        return None
+
+
+def save_markdown_report(output_path, df, missing, numeric, categorical, correlation, outliers, insights, llm_text=None):
+    with open(output_path, "w", encoding="utf-8") as writer:
+        writer.write("# 自动化数据分析与洞察报告\n\n")
+        writer.write(f"生成时间：{pd.Timestamp.now()}\n\n")
+        writer.write(f"数据集行数：{len(df)}，列数：{len(df.columns)}\n\n")
+
+        writer.write("## 1. 缺失值概览\n\n")
+        writer.write(missing.to_markdown(index=True, tablefmt="github", showindex=True))
+        writer.write("\n\n")
+
+        if not numeric.empty:
+            writer.write("## 2. 数值统计摘要\n\n")
+            writer.write(numeric.to_markdown(index=True, tablefmt="github", showindex=True))
+            writer.write("\n\n")
+
+        if not categorical.empty:
+            writer.write("## 3. 类别字段摘要\n\n")
+            writer.write(categorical.to_markdown(index=False, tablefmt="github"))
+            writer.write("\n\n")
+
+        if not correlation.empty:
+            writer.write("## 4. 相关性分析\n\n")
+            writer.write(correlation.to_markdown(index=True, tablefmt="github", showindex=True))
+            writer.write("\n\n")
+
+        if not outliers.empty:
+            writer.write("## 5. 异常值检测\n\n")
+            writer.write(outliers.to_markdown(index=False, tablefmt="github"))
+            writer.write("\n\n")
+
+        writer.write("## 6. 自动生成洞察\n\n")
+        for idx, item in enumerate(insights, start=1):
+            writer.write(f"{idx}. {item}\n")
+        writer.write("\n")
+
+        if llm_text:
+            writer.write("## 7. GPT 增强洞察\n\n")
+            writer.write(llm_text + "\n")
+
+    print(f"报告已保存到：{output_path}")
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(description="自动化数据分析与洞察生成 Agent")
+    parser.add_argument("--input", required=True, help="输入数据文件路径，支持 CSV、XLSX、PARQUET")
+    parser.add_argument("--output", required=True, help="输出 Markdown 报告文件路径")
+    parser.add_argument("--target", default=None, help="可选的目标变量名称，用于相关性分析")
+    parser.add_argument("--no-openai", action="store_true", help="禁用 OpenAI GPT 增强（如果已配置则不调用）")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_arguments()
+    df = load_data(args.input)
+
+    missing = summarize_missing(df)
+    numeric = summarize_numeric(df)
+    categorical = summarize_categorical(df)
+    correlation = correlation_summary(df, target=args.target, top_n=10)
+    outliers = detect_outliers(df)
+    insights = build_insights(df, target=args.target)
+
+    llm_text = None
+    if not args.no_openai and openai is not None and os.getenv("OPENAI_API_KEY"):
+        llm_text = call_openai_enhancement(insights, df, target=args.target)
+
+    save_markdown_report(
+        args.output,
+        df,
+        missing,
+        numeric,
+        categorical,
+        correlation,
+        outliers,
+        insights,
+        llm_text,
+    )
+
+
+if __name__ == "__main__":
+    main()
